@@ -1,58 +1,138 @@
-const fs = require("fs").promises;
-const path = require("path");
-const config = require("./config");
-const connect = require("./lib/connection");
-const { loadSession } = require("baileys");
-const io = require("socket.io-client");
-const { getandRequirePlugins } = require("./assets/database/plugins");
-const web = require("./lib/server");
+// XENO EXE ✅
 
-global.__basedir = __dirname; // Set the base directory for the 
+import express from "express";
+import pino from "pino";
+import fs from "fs-extra";
+import User from "./lib/user.js";
+import generateid from "./lib/id.js";
+import { exec } from "child_process";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+import makeWASocket, {
+    useMultiFileAuthState,
+    delay,
+    makeCacheableSignalKeyStore,
+    Browsers,
+    fetchLatestBaileysVersion
+} from "@whiskeysockets/baileys";
+import connectDatabase from "./lib/database.js";
 
-const readAndRequireFiles = async (directory) => {
-  try {
-    const files = await fs.readdir(directory);
-    return Promise.all(
-      files
-        .filter((file) => path.extname(file).toLowerCase() === ".js")
-        .map((file) => require(path.join(directory, file)))
-    );
-  } catch (error) {
-    console.error("Error reading and requiring files:", error);
-    throw error;
-  }
-};
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-async function initialize() {
-  console.log("XenoExe");
-  try {
-    if (config.SESSION_ID && !fs.existsSync("session")) {
-      console.log("Session id connecting...");
-      fs.mkdirSync("./session");
-      const credsData = await loadSession(config.SESSION_ID);
-      fs.writeFileSync(
-        "./session/creds.json",
-        JSON.stringify(credsData.creds, null, 2)
-      );
-    }
-    await readAndRequireFiles(path.join(__dirname, "/assets/database/"));
-    console.log("Syncing Database");
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-    await config.DATABASE.sync();
+app.set("json spaces", 4)
+connectDatabase();
 
-    console.log("⬇  Installing Plugins...");
-    await readAndRequireFiles(path.join(__dirname, "/assets/plugins/"));
-    await getandRequirePlugins();
-    console.log("✅ Plugins Installed!");
-    const ws = io("https://socket.xasena.me/", { reconnection: true });
-    ws.on("connect", () => console.log("Connected to server"));
-    ws.on("disconnect", () => console.log("Disconnected from server"));
-    await connect();
-    await web();
-  } catch (error) {
-    console.error("Initialization error:", error);
-    return process.exit(1); // Exit with error status
-  }
+app.get("/", (req, res) => {
+    res.sendFile(__dirname + "/lib/pair.html");
+});
+
+if (fs.existsSync("./session")) {
+    fs.emptyDirSync(__dirname + "/session");
 }
+console.log("folder cleaned");
 
-initialize();
+app.get("/session", async (req, res) => {
+    const id = req.query.id;
+    if (!id) return res.json({
+        status: false,
+        message: "session id required"
+    });
+    const user = await User.findOne({
+        sessionId: id.split('~')[1] || id.split(':')[1] || id
+    });
+
+    if (!user) return res.json({
+        status: false,
+        message: "Session not found"
+    });
+
+    return res.json({
+        status: true,
+        creator: "XENO EXE",
+        data: user.creds
+    });
+})
+
+app.get("/pairing", async (req, res) => {
+    let num = req.query.number;
+
+    async function xenoPair() {
+        const { state, saveCreds } = await useMultiFileAuthState("./session");
+        try {
+            const { version, isLatest } = await fetchLatestBaileysVersion();
+            console.log(`Using WA v${version.join('.')}, isLatest: ${isLatest}`);
+            let xeno = makeWASocket({
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+                },
+                printQRInTerminal: false,
+                version,
+                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+                browser: ["Ubuntu", "Chrome", "124.0.0"],
+            });
+
+            if (!xeno.authState.creds.registered) {
+                await delay(1500);
+                num = num.replace(/[^0-9]/g, "");
+                const code = await xeno.requestPairingCode(num);
+                if (!res.headersSent) {
+                    await res.send({ code });
+                }
+            }
+
+            xeno.ev.on("creds.update", saveCreds);
+
+            xeno.ev.on("connection.update", async (s) => {
+                const { connection, lastDisconnect } = s;
+
+                if (connection === "open") {
+                    await delay(10000);
+                    const sessionxeno = fs.readFileSync("./session/creds.json", "utf8");
+                    let encoded = generateid();
+                    const userJid = xeno.user?.id?.replace(/:.*@/, '@');
+                    let session = await xeno.sendMessage(userJid, {
+                        text: "XenoExe~" + encoded,
+                    });
+                    let text =
+                        "*Thank You for Using XENO_EXE_MD*\n\n\nDeveloper Contact: +919645991937\n\nOfficial Channel: https://instagram.com/x3n0.s8r\n\nWe appreciate your feedback and are here to assist you!";
+                    await xeno.sendMessage(
+                        userJid,
+                        { text },
+                        { quoted: session }
+                    );
+                    const user = await User.create({
+                        sessionId: encoded,
+                        creds: sessionxeno
+                    })
+                    console.log(user);
+                    await delay(3000);
+                    fs.emptyDirSync(__dirname + "/session");
+                    console.log("_Restarting..._");
+                    process.exit(0);
+                } else if (
+                    connection === "close" &&
+                    lastDisconnect?.error?.output?.statusCode !== 401
+                ) {
+                    await delay(10000);
+                    xenoPair();
+                }
+            });
+        } catch (err) {
+            console.log("service restarted");
+            fs.emptyDirSync(__dirname + "/session");
+            if (!res.headersSent) {
+                await res.send({ code: "Service Unavailable" });
+            }
+            console.log(err);
+        }
+    }
+
+    return await xenoPair();
+});
+
+app.listen(PORT, () => console.log("App listened on port", PORT));
