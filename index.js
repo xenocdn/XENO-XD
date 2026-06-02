@@ -5,14 +5,12 @@ import pino from "pino";
 import fs from "fs-extra";
 import User from "./lib/user.js";
 import generateid from "./lib/id.js";
-import { exec } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 import makeWASocket, {
     useMultiFileAuthState,
     delay,
     makeCacheableSignalKeyStore,
-    Browsers,
     fetchLatestBaileysVersion
 } from "@whiskeysockets/baileys";
 import connectDatabase from "./lib/database.js";
@@ -23,17 +21,32 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.set("json spaces", 4)
+// ── CORS: allow all origins ──
+app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") return res.sendStatus(200);
+    next();
+});
+
+app.set("json spaces", 4);
 connectDatabase();
+
+// ── Health check for Koyeb (must return 200 quickly) ──
+app.get("/health", (req, res) => {
+    res.status(200).json({ status: "ok", uptime: process.uptime() });
+});
 
 app.get("/", (req, res) => {
     res.sendFile(__dirname + "/lib/pair.html");
 });
 
+// Clean session folder on startup
 if (fs.existsSync("./session")) {
     fs.emptyDirSync(__dirname + "/session");
 }
-console.log("folder cleaned");
+console.log("Session folder cleaned");
 
 app.get("/session", async (req, res) => {
     const id = req.query.id;
@@ -55,10 +68,20 @@ app.get("/session", async (req, res) => {
         creator: "XENO EXE",
         data: user.creds
     });
-})
+});
 
 app.get("/pairing", async (req, res) => {
     let num = req.query.number;
+
+    // Guard: number must be provided
+    if (!num) return res.json({ code: "Service Unavailable", reason: "Phone number is required" });
+
+    // ── 30-second timeout so client never hangs ──
+    const timeout = setTimeout(() => {
+        if (!res.headersSent) res.json({ code: "Service Unavailable", reason: "Request timed out" });
+    }, 30000);
+    res.on("finish", () => clearTimeout(timeout));
+    res.on("close", () => clearTimeout(timeout));
 
     async function xenoPair() {
         const { state, saveCreds } = await useMultiFileAuthState("./session");
@@ -105,15 +128,16 @@ app.get("/pairing", async (req, res) => {
                         { text },
                         { quoted: session }
                     );
-                    const user = await User.create({
+                    await User.create({
                         sessionId: encoded,
                         creds: sessionxeno
-                    })
-                    console.log(user);
+                    });
+                    console.log("Session saved:", encoded);
                     await delay(3000);
+                    // Close WA socket cleanly — DO NOT process.exit() on Koyeb
                     fs.emptyDirSync(__dirname + "/session");
-                    console.log("_Restarting..._");
-                    process.exit(0);
+                    console.log("Ready for next pairing.");
+                    xeno.end();
                 } else if (
                     connection === "close" &&
                     lastDisconnect?.error?.output?.statusCode !== 401
@@ -123,16 +147,15 @@ app.get("/pairing", async (req, res) => {
                 }
             });
         } catch (err) {
-            console.log("service restarted");
+            console.log("Pairing error:", err.message);
             fs.emptyDirSync(__dirname + "/session");
             if (!res.headersSent) {
                 await res.send({ code: "Service Unavailable" });
             }
-            console.log(err);
         }
     }
 
     return await xenoPair();
 });
 
-app.listen(PORT, () => console.log("App listened on port", PORT));
+app.listen(PORT, () => console.log(`XENO EXE MD Pair running on port ${PORT}`));
